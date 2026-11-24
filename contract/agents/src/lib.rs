@@ -3479,4 +3479,124 @@ mod test {
         assert_eq!(policy.max_per_day_stroops, new_max_day);
         assert_eq!(policy.min_score_to_earn, new_min_score);
     }
+
+    // ── allowed_categories safety through payment outcomes ────────────────────
+    //
+    // A category update followed by a failed payment must not corrupt
+    // allowed_categories or credit extra daily spend.  A successful payment
+    // must also leave the category list intact.
+
+    /// After updating allowed_categories, a failed payment must preserve the
+    /// updated list and must not increment daily_spent_stroops.
+    #[test]
+    fn test_failed_payment_preserves_allowed_categories_and_spend() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, _admin) = setup_with_registry(&env);
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+
+        let provider = Address::generate(&env);
+        let registry_id = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::RegistryContract)
+                .expect("registry contract not set")
+        });
+        MockRegistryClient::new(&env, &registry_id).set_provider(&provider);
+
+        let categories = vec![
+            &env,
+            String::from_str(&env, "weather"),
+            String::from_str(&env, "search"),
+        ];
+        client.update_policy(
+            &agent_addr,
+            &10_000_000_000i128,
+            &100_000_000_000i128,
+            &categories,
+            &0,
+            &owner,
+        );
+
+        let before = client.get_policy(&agent_addr).unwrap();
+        assert_eq!(before.allowed_categories, categories);
+        assert_eq!(before.daily_spent_stroops, 0);
+
+        client.record_payment(&agent_addr, &1u64, &5_000_000i128, &false, &provider);
+
+        let after = client.get_policy(&agent_addr).unwrap();
+        assert_eq!(
+            after.allowed_categories, categories,
+            "failed payment must not alter allowed_categories"
+        );
+        assert_eq!(
+            after.daily_spent_stroops, 0,
+            "failed payment must not increment daily_spent_stroops"
+        );
+
+        let agent = client.get_agent(&agent_addr).unwrap();
+        assert_eq!(
+            agent.score,
+            (INITIAL_SCORE + SCORE_FAILURE).max(0),
+            "score must still be penalised on failure"
+        );
+    }
+
+    /// After updating allowed_categories, a successful payment must preserve
+    /// the updated list and must only credit the exact payment amount to
+    /// daily_spent_stroops.
+    #[test]
+    fn test_successful_payment_preserves_allowed_categories() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, _admin) = setup_with_registry(&env);
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+
+        let provider = Address::generate(&env);
+        let registry_id = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::RegistryContract)
+                .expect("registry contract not set")
+        });
+        MockRegistryClient::new(&env, &registry_id).set_provider(&provider);
+
+        let categories = vec![
+            &env,
+            String::from_str(&env, "finance"),
+            String::from_str(&env, "analytics"),
+        ];
+        let amount = 3_000_000i128;
+        client.update_policy(
+            &agent_addr,
+            &10_000_000_000i128,
+            &100_000_000_000i128,
+            &categories,
+            &0,
+            &owner,
+        );
+
+        client.record_payment(&agent_addr, &1u64, &amount, &true, &provider);
+
+        let after = client.get_policy(&agent_addr).unwrap();
+        assert_eq!(
+            after.allowed_categories, categories,
+            "successful payment must not alter allowed_categories"
+        );
+        assert_eq!(
+            after.daily_spent_stroops, amount,
+            "daily_spent_stroops must equal exactly the payment amount"
+        );
+
+        let agent = client.get_agent(&agent_addr).unwrap();
+        assert_eq!(agent.score, INITIAL_SCORE + SCORE_SUCCESS);
+    }
 }
